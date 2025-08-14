@@ -1,0 +1,390 @@
+import React, { useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { Upload, Sparkles, Copy, Check, ImageIcon, Download, Trash2 } from "lucide-react";
+
+/**
+ * AI-Postgenerator – fra bunden (MVP)
+ *
+ * Formål: Gør det super nemt at lave et SoMe-post: brugeren udfylder få felter →
+ * appen genererer 3 caption-varianter og vælger bedste billede ud fra enkle regler.
+ *
+ * To modes:
+ * 1) "Regel-baseret" (offline): Skaber gode, konsistente tekster uden API-nøgler.
+ * 2) "LLM (API)" (valgfri): Klart markeret hook til at kalde en sprogmodel, hvis I vil.
+ *
+ * Billedvalg: Brugeren kan uploade 1–6 billeder. Appen scorer billederne på filnavn + EXIF alt. tekst
+ * ift. produktnavn, farve, sæson, kampagne. Bedste score vælges.
+ *
+ * Export: Kopiér-tekst, download JSON med valgte felter + caption + valgt billede.
+ */
+
+// --- Små hjælpefunktioner ---
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)] || "";
+
+function scoreImage(file, keywords) {
+  // Heuristik: match på filnavn/"name" string
+  const name = (file?.name || "").toLowerCase();
+  let score = 0;
+  for (const kw of keywords) {
+    if (!kw) continue;
+    const k = String(kw).toLowerCase();
+    if (name.includes(k)) score += 2; // stærk match
+    // simple stemming
+    if (k.endsWith("er") && name.includes(k.slice(0, -2))) score += 1;
+  }
+  // bonus for billedformat og størrelse (hvis tilgængeligt)
+  if (name.includes("white") || name.includes("hvid")) score += 1;
+  return score;
+}
+
+function templateCaption(input) {
+  // Regel-baseret fallback caption-generator (3 varianter)
+  const {
+    productName, color, season, story, campaign, cta,
+    audience, channel, tone = "varm og enkel", wordCount = 50,
+    hashtags = ["#queenflowers", "#sæsonensblomster"],
+  } = input;
+
+  const ask = clamp(Number(wordCount) || 50, 25, 90);
+
+  const openers = [
+    `Sig hej til ${productName}${color ? ` i ${color}` : ""}`,
+    `${productName}${color ? ` – ${color}` : ""} til ${season || "sæsonen"}`,
+    `${campaign ? `${campaign}: ` : ""}${productName}${color ? ` i ${color}` : ""}`,
+    `Gør plads på bordet til ${productName}`,
+  ];
+
+  const feels = [
+    "skaber lethed og hverdagsglæde",
+    "giver dit bord et roligt, nordisk udtryk",
+    "sætter en blid, romantisk stemning",
+    "løfter weekenden med et enkelt greb",
+  ];
+
+  const closers = [
+    `${cta || "Se udvalget"} – ${channel || "Instagram"}`,
+    `${cta || "Se udvalget"} og gem til senere`,
+    `${cta || "Se udvalget"} og del stemningen`,
+  ];
+
+  const imgIdeas = [
+    "Nærbillede på hvid baggrund med bløde skygger",
+    "Sommerbord på terrasse, naturligt lys, bløde pasteller",
+    "Buket i glasvase ved vindue, morgensol",
+    "Picnictæppe med buket, stråhat ved siden af",
+  ];
+
+  const base = (idx) => {
+    const opener = pick(openers);
+    const feel = pick(feels);
+    const closer = pick(closers);
+    const ht = hashtags.slice(0, 2).join(" ");
+
+    // Enkel længdekontrol ved at trimme sætninger
+    let copy = `${opener}. ${story ? story + ". " : ""}${productName} ${feel}. ${closer}. ${ht}`;
+    const words = copy.split(/\s+/);
+    if (words.length > ask) copy = words.slice(0, ask).join(" ") + "…";
+
+    return {
+      title: `${campaign || season || channel || "Opslag"} – ${idx + 1}`,
+      copy,
+      hashtags: hashtags.slice(0, 2),
+      imageIdea: pick(imgIdeas),
+    };
+  };
+
+  return [base(0), base(1), base(2)];
+}
+
+async function generateWithLLM(input) {
+  // Valgfri LLM-kald – udfyld selv med jeres API.
+  // Returnér i samme format som templateCaption().
+  // Eksempel (pseudo):
+  // const res = await fetch("/api/generate", { method: "POST", body: JSON.stringify(input) });
+  // return await res.json();
+  return templateCaption(input); // fallback til regel-baseret
+}
+
+function useClipboard() {
+  const [copied, setCopied] = useState(false);
+  const copy = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {}
+  };
+  return { copied, copy };
+}
+
+export default function AIPostGenerator() {
+  // --- Simple dev tests (run once in dev) ---
+  if (typeof window !== 'undefined' && !window.__POSTGEN_TESTED__) {
+    window.__POSTGEN_TESTED__ = true;
+    // scoreImage test
+    const fakeFile = { name: 'Elseflower-pink-sommer.jpg' };
+    const s = scoreImage(fakeFile, ['Elseflower','Pink','Sommer','Trending']);
+    console.assert(s >= 3, 'scoreImage should give a positive score for matching keywords');
+    // templateCaption test
+    const caps = templateCaption({ productName:'Elseflower', color:'Pink', season:'Sommer', story:'Mangebladet', campaign:'Trending', cta:'Se udvalget', channel:'Instagram', hashtags:['#queenflowers','#sæsonensblomster'] });
+    console.assert(Array.isArray(caps) && caps.length===3, 'templateCaption should return 3 variants');
+  }
+  const fileInputRef = useRef(null);
+  const [images, setImages] = useState([]); // File[]
+  const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState("rules"); // "rules" | "llm"
+  const [variants, setVariants] = useState([]);
+  const [selectedIdx, setSelectedIdx] = useState(0);
+
+  // Minimal input – nemt for brugeren
+  const [productName, setProductName] = useState("");
+  const [campaign, setCampaign] = useState("");
+  const [cta, setCta] = useState("Se udvalget");
+  const [channel, setChannel] = useState("Instagram");
+
+  // Valgfrit (giver bedre output)
+  const [color, setColor] = useState("");
+  const [season, setSeason] = useState("");
+  const [story, setStory] = useState("");
+  const [audience, setAudience] = useState("");
+  const [tone, setTone] = useState("varm og enkel");
+  const [wordCount, setWordCount] = useState(50);
+  const [hashtags, setHashtags] = useState("#queenflowers,#sæsonensblomster");
+
+  const { copied, copy } = useClipboard();
+
+  const keywords = useMemo(() => [productName, color, season, campaign], [productName, color, season, campaign]);
+
+  const bestImage = useMemo(() => {
+    if (!images.length) return null;
+    let best = { idx: 0, score: -1 };
+    images.forEach((f, idx) => {
+      const s = scoreImage(f, keywords);
+      if (s > best.score) best = { idx, score: s };
+    });
+    return images[best.idx] || null;
+  }, [images, keywords]);
+
+  function handleFiles(files) {
+    const arr = Array.from(files || []);
+    setImages((prev) => [...prev, ...arr].slice(0, 6));
+  }
+
+  function resetImages() {
+    setImages([]);
+  }
+
+  async function onGenerate() {
+    if (!productName) {
+      alert("Udfyld mindst produktnavn.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const input = {
+        productName, color, season, story, campaign, cta, audience, channel,
+        tone, wordCount, hashtags: hashtags.split(",").map((s) => s.trim()).filter(Boolean),
+      };
+      const out = mode === "llm" ? await generateWithLLM(input) : templateCaption(input);
+      setVariants(out);
+      setSelectedIdx(0);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onDownloadJSON() {
+    const chosen = variants[selectedIdx];
+    const payload = {
+      input: { productName, color, season, story, campaign, cta, audience, channel, tone, wordCount, hashtags },
+      output: chosen,
+      chosenImage: bestImage ? bestImage.name : null,
+      timestamp: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `post-${productName || "untitled"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const chosen = variants[selectedIdx];
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 p-6">
+      <div className="mx-auto max-w-6xl">
+        <motion.h1 layout className="text-2xl md:text-3xl font-semibold mb-4">AI-Postgenerator (caption + billedvalg)</motion.h1>
+        <p className="text-slate-600 mb-6">Udfyld få felter → klik <em>Generér</em> → vælg variant → kopier caption og download JSON. Upload valgfrit 1–6 billeder for automatisk billedvalg.</p>
+
+        {/* Form + Preview layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+          {/* Form */}
+          <div className="lg:col-span-2">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="p-4 rounded-2xl shadow-sm border bg-white">
+                <h2 className="text-lg font-medium mb-3">Minimum</h2>
+                <label className="block text-sm">Produktnavn</label>
+                <input value={productName} onChange={(e)=>setProductName(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Elseflower"/>
+                <label className="block text-sm">Kampagnetema</label>
+                <input value={campaign} onChange={(e)=>setCampaign(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Trending"/>
+                <label className="block text-sm">CTA</label>
+                <input value={cta} onChange={(e)=>setCta(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Se udvalget"/>
+                <label className="block text-sm">Kanal</label>
+                <select value={channel} onChange={(e)=>setChannel(e.target.value)} className="w-full border rounded-xl p-2">
+                  <option>Instagram</option>
+                  <option>Facebook</option>
+                  <option>Newsletter</option>
+                </select>
+              </div>
+
+              <div className="p-4 rounded-2xl shadow-sm border bg-white">
+                <h2 className="text-lg font-medium mb-3">Valgfrit (giver bedre output)</h2>
+                <label className="block text-sm">Farve</label>
+                <input value={color} onChange={(e)=>setColor(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Pink"/>
+                <label className="block text-sm">Sæson</label>
+                <input value={season} onChange={(e)=>setSeason(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Sommer"/>
+                <label className="block text-sm">Kort historie</label>
+                <input value={story} onChange={(e)=>setStory(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Mangebladet blomst perfekt til sommerbordet"/>
+                <label className="block text-sm">Målgruppe (1 linje)</label>
+                <input value={audience} onChange={(e)=>setAudience(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="Kvinder 20–40, elsker godt vejr"/>
+              </div>
+
+              <div className="p-4 rounded-2xl shadow-sm border bg-white">
+                <h2 className="text-lg font-medium mb-3">Stil</h2>
+                <label className="block text-sm">Tone</label>
+                <input value={tone} onChange={(e)=>setTone(e.target.value)} className="w-full border rounded-xl p-2 mb-2" placeholder="varm og enkel"/>
+                <label className="block text-sm">Ordantal</label>
+                <input type="number" value={wordCount} onChange={(e)=>setWordCount(e.target.value)} className="w-full border rounded-xl p-2 mb-2" min={25} max={90}/>
+                <label className="block text-sm">Hashtags (komma-separeret)</label>
+                <input value={hashtags} onChange={(e)=>setHashtags(e.target.value)} className="w-full border rounded-xl p-2"/>
+              </div>
+
+              <div className="p-4 rounded-2xl shadow-sm border bg-white">
+                <h2 className="text-lg font-medium mb-3">Billeder (valgfrit)</h2>
+                <div className="flex items-center gap-2 mb-2">
+                  <button onClick={()=>fileInputRef.current?.click()} className="inline-flex items-center gap-2 px-3 py-2 rounded-2xl shadow-sm border">
+                    <Upload className="w-4 h-4"/> Upload
+                  </button>
+                  {images.length>0 && (
+                    <button onClick={resetImages} className="inline-flex items-center gap-2 px-3 py-2 rounded-2xl shadow-sm border">
+                      <Trash2 className="w-4 h-4"/> Ryd
+                    </button>
+                  )}
+                  <input type="file" ref={fileInputRef} className="hidden" accept="image/*" multiple onChange={(e)=>handleFiles(e.target.files)} />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {images.map((f, i)=> (
+                    <div key={i} className={`aspect-square rounded-xl border overflow-hidden ${bestImage && bestImage.name===f.name? 'ring-2 ring-indigo-500': ''}`}>
+                      <img src={URL.createObjectURL(f)} alt={f.name} className="w-full h-full object-cover"/>
+                    </div>
+                  ))}
+                  {images.length===0 && (
+                    <div className="col-span-3 flex items-center justify-center aspect-video rounded-xl border text-slate-400">
+                      <ImageIcon className="w-5 h-5 mr-2"/> Ingen billeder endnu
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 mt-4">
+              <button onClick={onGenerate} disabled={busy} className="inline-flex items-center gap-2 px-4 py-2 rounded-2xl shadow-sm border bg-black text-white">
+                <Sparkles className="w-4 h-4"/>
+                {busy? 'Genererer…' : 'Generér 3 varianter'}
+              </button>
+              <div className="text-sm text-slate-500">Mode:</div>
+              <select value={mode} onChange={(e)=>setMode(e.target.value)} className="border rounded-xl p-2">
+                <option value="rules">Regel-baseret (ingen API)</option>
+                <option value="llm">LLM (kræver API)</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Preview / Output */}
+          <div className="lg:col-span-1">
+            <div className="p-4 rounded-2xl shadow-sm border bg-white sticky top-4">
+              <h2 className="text-lg font-medium mb-3">Resultat</h2>
+              {variants.length === 0 ? (
+                <p className="text-slate-500">Udfyld felter og klik <em>Generér</em>. Output vises her.</p>
+              ) : (
+                <div>
+                  <div className="flex gap-2 mb-3">
+                    {variants.map((v, i)=> (
+                      <button key={i} onClick={()=>setSelectedIdx(i)} className={`px-3 py-1 rounded-full border text-sm ${selectedIdx===i? 'bg-black text-white':'bg-white'}`}>{i+1}</button>
+                    ))}
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-400">Titel</div>
+                    <div className="font-medium">{chosen?.title}</div>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-400">Caption</div>
+                    <p className="whitespace-pre-wrap text-slate-800">{chosen?.copy}</p>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-400">Hashtags</div>
+                    <div>{chosen?.hashtags?.join(" ")}</div>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-400">Foreslået billedidé</div>
+                    <div>{chosen?.imageIdea}</div>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-400">Valgt billede</div>
+                    {bestImage ? (
+                      <div className="rounded-xl overflow-hidden border">
+                        <img src={URL.createObjectURL(bestImage)} alt={bestImage.name} className="w-full h-48 object-cover"/>
+                        <div className="text-xs p-2 text-slate-500">{bestImage.name}</div>
+                      </div>
+                    ) : (
+                      <div className="text-slate-500">Intet uploadet – brug billedidéen ovenfor.</div>
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button onClick={()=>copy(chosen?.copy || "")} className="inline-flex items-center gap-2 px-3 py-2 rounded-2xl border">
+                      {copied ? <Check className="w-4 h-4"/> : <Copy className="w-4 h-4"/>}
+                      {copied? 'Kopieret!' : 'Kopiér caption'}
+                    </button>
+                    <button onClick={onDownloadJSON} className="inline-flex items-center gap-2 px-3 py-2 rounded-2xl border">
+                      <Download className="w-4 h-4"/> Download JSON
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Hjælp / Instruktion */}
+        <div className="mt-6 p-4 rounded-2xl border bg-white text-sm text-slate-600">
+          <details>
+            <summary className="cursor-pointer font-medium">Hvordan virker billedvalg?</summary>
+            <div className="mt-2">Vi scorer filnavnet på dine uploadede billeder mod nøgleord (produktnavn, farve, sæson, kampagne). Bedste match markeres automatisk. Døb filerne fornuftigt (fx <em>Elseflower-pink-sommer.jpg</em>) for at hjælpe algoritmen.</div>
+          </details>
+          <details className="mt-2">
+            <summary className="cursor-pointer font-medium">LLM-mode (valgfri)</summary>
+            <div className="mt-2">Vælg <em>LLM</em> i dropdown og implementér et API-kald i <code>generateWithLLM()</code>. Returnér samme struktur som den regel-baserede generator: <code>[{`{ title, copy, hashtags, imageIdea }`}]</code>. Så kan I skifte mellem offline og AI uden at ændre UI.</div>
+          </details>
+          <details className="mt-2">
+            <summary className="cursor-pointer font-medium">Tip til kvalitet</summary>
+            <ul className="list-disc ml-5 mt-2">
+              <li>Hold ordantal 40–60 som udgangspunkt.</li>
+              <li>Én relevant emoji maks.</li>
+              <li>Ingen helbredspåstande.</li>
+              <li>Brug kampagnens CTA og 1–2 hashtags.</li>
+            </ul>
+          </details>
+        </div>
+      </div>
+    </div>
+  );
+}
